@@ -1,10 +1,13 @@
 import pandas as pd
 import numpy as np
 import re
-import torch
-from transformers import OpenAIGPTTokenizer, DataCollatorForLanguageModeling, TextDataset, OpenAIGPTLMHeadModel, \
-    Trainer, TrainingArguments, pipeline
-
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from keras.preprocessing.sequence import pad_sequences
+from keras.layers import Embedding, LSTM, Dense, Bidirectional
+from keras.preprocessing.text import Tokenizer
+from keras.models import Sequential
+from keras.optimizers import RMSprop
 # ---------------------------- load the dataset ----------------------------
 
 with open("sherlock.txt", "r") as file:
@@ -18,7 +21,8 @@ print(data)
 
 data = data.iloc[:11874]
 def remove_chars(dataset):
-    cleaned_dataset = re.sub(r'[_\n]', ' ', dataset)
+    remove_n = re.sub(r'\n', ' ', dataset)
+    cleaned_dataset = re.sub(r'_', '', remove_n)
     return cleaned_dataset
 data = data[None].apply(remove_chars)
 
@@ -56,69 +60,82 @@ print(data.iloc[63])
 print(data.iloc[75])
 
 
-# ---------------------------- Train and Test split  ----------------------------
+# ---------------------------- tokenize ----------------------------
 
-train = data[0:int(0.8*len(data))]
-test = data[int(0.8*len(data)):]
-
-train=''.join(train)
-test=''.join(test)
-
-with open("train.txt", "w") as fp:
-    fp.write(train)
-with open("test.txt", "w") as fp:
-    fp.write(test)
+tokenizer = Tokenizer(oov_token='<oov>')
+tokenizer.fit_on_texts(data)
+total_words = len(tokenizer.word_index) + 1
+print("Total number of words: ", total_words)
+print("<oov>: ", tokenizer.word_index['<oov>'])
+print("holmes: ", tokenizer.word_index['holmes'])
+print("i: ", tokenizer.word_index['i'])
+print("he: ", tokenizer.word_index['he'])
 
 
-# ---------------------------- tokenization ----------------------------
+# ---------------------------- n_gram ----------------------------
 
-tokenizer = OpenAIGPTTokenizer.from_pretrained("openai-gpt")
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+input_sequences = []
+for line in data:
+    token_list = tokenizer.texts_to_sequences([line])[0]
+    print(token_list)
 
-train_dataset = TextDataset(
-    tokenizer=tokenizer,
-    file_path='train.txt',
-    overwrite_cache=True,
-    block_size=20)
+    for i in range(1, len(token_list)):
+        n_gram_sequence = token_list[:i + 1]
+        input_sequences.append(n_gram_sequence)
 
-test_dataset = TextDataset(
-    tokenizer=tokenizer,
-    file_path='test.txt',
-    overwrite_cache=True,
-    block_size=20)
+print(input_sequences)
+print("Total input sequences: ", len(input_sequences))
 
 
-# ---------------------------- load pretrained model + fine tuning ----------------------------
+# ---------------------------- padding ----------------------------
 
-model = OpenAIGPTLMHeadModel.from_pretrained('openai-gpt')
-training_args = TrainingArguments(
-    output_dir = 'gpt_model',
-    overwrite_output_dir = True,
-    per_device_train_batch_size = 3,
-    per_device_eval_batch_size = 3,
-    learning_rate = 5e-4,
-    num_train_epochs = 3,
-)
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    data_collator=data_collator,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset
-)
+max_sequence_len = max([len(x) for x in input_sequences])
+input_sequences = np.array(pad_sequences(input_sequences, maxlen=max_sequence_len, padding='post'))
+input_sequences[5]
 
 
-# ---------------------------- train + evaluate ----------------------------
+# ---------------------------- feature selection ----------------------------
 
-trainer.train()
-trainer.save_model()
-trainer.evaluate(test_dataset)
+xs, labels = input_sequences[:,:-1],input_sequences[:,-1]
+ys = tf.keras.utils.to_categorical(labels, num_classes=total_words)
 
 
-# ---------------------------- pipeline ----------------------------
+# ---------------------------- build and fit model: BiLSTM ---------------------------
 
-generator = pipeline('text-generation', tokenizer='openai-gpt', model='gpt_model')
+model = Sequential()
+model.add(Embedding(total_words, 150, input_length=max_sequence_len-1))
+model.add(Bidirectional(LSTM(200, return_sequences=True)))
+model.add(Bidirectional(LSTM(200)))
+model.add(Dense(total_words, activation='softmax'))
+model.summary()
+model.compile(loss='categorical_crossentropy', optimizer= RMSprop(learning_rate=0.01), metrics=['accuracy'])
+history = model.fit(xs, ys, epochs=1, verbose=1)
 
-print(generator('i will ', max_length=5)[0]['generated_text'])
-print(generator('i will ', max_length=5,num_beams = 5)[0]['generated_text'])
-print(generator('i will ' , max_length=5 , do_sample=True,temperature = 0.7)[0]['generated_text'])
+
+# ---------------------------- evaluate ---------------------------
+
+def plot_graphs(history, string):
+    plt.plot(history.history[string])
+    plt.xlabel("Epochs")
+    plt.ylabel(string)
+    plt.show()
+plot_graphs(history, 'accuracy')
+plot_graphs(history, 'loss')
+
+
+# ---------------------------- predict ---------------------------
+
+seed_text = "holmes and i"
+next_words = 2
+
+for _ in range(next_words):
+    token_list = tokenizer.texts_to_sequences([seed_text])[0]
+    token_list = pad_sequences([token_list], maxlen=max_sequence_len - 1, padding='pre')
+    predicted = model.predict_classes(token_list, verbose=0)
+    output_word = ""
+    for word, index in tokenizer.word_index.items():
+        if index == predicted:
+            output_word = word
+            break
+    seed_text += " " + output_word
+print(seed_text)
